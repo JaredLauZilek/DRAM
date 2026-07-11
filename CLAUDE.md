@@ -23,7 +23,7 @@ Supabase changes are applied to the live project, not just to files. Two ways:
 
 ## Architecture — the big picture
 
-Data flows in one direction, and the two halves never write the same table:
+Data flows in one direction, and the two writers own disjoint fields (they share the `app_config` row but never set the same columns):
 
 ```
 Finnhub /quote ─┐
@@ -31,16 +31,17 @@ Finnhub /quote ─┐
         daily-signal (edge fn, Deno, SERVICE ROLE)
    reads app_config + catalysts + contract_log
    computes ONE verdict ──> writes snapshots (one row/day)
+                            + auto-tracks app_config.peaks (Yahoo 52-wk high)
                                    │
                                    ▼
         React app (anon key) reads snapshots[latest]  ──> Desk tab
         React app (anon key) writes app_config / contract_log / catalysts ──> Settings tab
 ```
 
-- **`src/App.jsx`** is the entire UI (Desk + Settings tabs, all subcomponents in one file). `loadAll()` fetches the 4 tables in parallel on mount; every mutation calls `reload()`.
+- **`src/App.jsx`** is the entire UI (Desk + Settings tabs, all subcomponents in one file). `loadAll()` fetches the 4 tables in parallel on mount; every mutation calls `reload()`. The **Desk renders even without a snapshot** — only the verdict card and price cards need `snap`; the cycle meter, contract log, catalysts, and journal are driven by `log`/`cats`/`cfg` and show regardless (important while no Finnhub key is set). The Desk is otherwise read-only *except* the **decision journal**, which autosaves to `app_config.journal` — a deliberate exception to the Desk-reads / Settings-writes split, because the journal is used at the desk.
 - **`src/lib/supabase.js`** owns the client and `refreshNow()` (POSTs to the edge function to trigger an on-demand recompute).
-- **`supabase/functions/daily-signal/index.ts`** is the *only* place verdict logic lives. The frontend never computes the verdict — it only maps `verdict → color/label` (`VERDICT_META`) and re-derives the contract *trigger banner* from the log for display.
-- **`supabase/migrations/0001_init.sql`** is the canonical schema + seed + RLS. Treat it as the source of truth for DB shape.
+- **`supabase/functions/daily-signal/index.ts`** is the *only* place verdict logic lives. The frontend never computes the verdict — it only maps `verdict → color/label` (`VERDICT_META`) and derives *display-only* reads from the contract log: `cycleRead()` (feeds the cycle-position meter **and** the `TriggerBanner`). These mirror the edge function's contract-trigger dimension but never set the verdict.
+- **`supabase/migrations/`** holds the canonical schema. `0001_init.sql` = tables + seed + RLS; `0002_journal_and_notes.sql` = additive columns (`app_config.journal`, `catalysts.note`); `0003_daily_cron.sql` = `pg_cron`/`pg_net` + the daily job; `0004_snapshot_intel.sql` = `snapshots.intel` (auto-crawled DDR5 news read). Treat these as the source of truth for DB shape; **migrations must be applied to the live project** (MCP `apply_migration`, `supabase db push`, or SQL editor) — editing the file alone does nothing.
 
 **The verdict is a monotonic escalation**, computed in the edge function: `HOLD(0) < WATCH(1) < ENTRY(2) < CAUTION(3)`. Each rule calls `escalate(to)` which only ever raises the level, never lowers it. To add a new signal, push a `reason` and call `escalate(...)` — do not reassign `verdict` directly. Priority is by design: CAUTION (bear trigger) outranks everything.
 
@@ -49,11 +50,11 @@ Finnhub /quote ─┐
 ## Infrastructure
 
 - **Supabase project:** `DRAM`, ref `vjqbircarzxcxrdzlyxj`, region `ap-northeast-2` (Seoul). Live and connected as of this writing.
-- **Tables** (all in `public`): `app_config` (hard single row, `id=1`), `contract_log`, `catalysts`, `snapshots` (one row per `snapshot_date`).
+- **Tables** (all in `public`): `app_config` (hard single row, `id=1`; includes `journal`), `contract_log`, `catalysts` (includes user-editable `note`, distinct from the pre-written `detail`), `snapshots` (one row per `snapshot_date`). The `journal` and `note` columns are added by migration `0002` — **if it hasn't been applied, journal/note saves fail** (the UI surfaces "apply the 0002 migration") while everything else works.
 - **Edge function:** `daily-signal`, deployed with `verify_jwt: true`.
-- **Secrets:** `FINNHUB_API_KEY` (edge secret — **not yet set**; until it is, the function returns `{"error":"FINNHUB_API_KEY not set"}` and writes no snapshot). `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` are auto-injected into the function.
+- **Secrets:** `FINNHUB_API_KEY` (edge secret — **set and working**; all four tickers resolve on the Finnhub free tier). `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` are auto-injected into the function.
 - **Frontend env** (`.env`, gitignored): `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`. Vite **inlines these at build time** — rebuild after any `.env` change.
-- **Cron:** not set up. The migration has a commented `pg_cron` block (needs `pg_cron` + `pg_net`); the app works on-demand via the "Refresh now" button without it.
+- **Cron:** **live.** `pg_cron` + `pg_net` are enabled and job `daily-memory-signal` runs `0 23 * * *` (23:00 UTC = 07:00 MYT), POSTing the anon JWT to the function via `net.http_post`. Deployed by migration `0003_daily_cron.sql`. The "Refresh now" button still works on-demand. Inspect runs via `cron.job` / `cron.job_run_details`; pg_net responses land in `net._http_response`.
 
 ## Security model (read before touching auth or RLS)
 
@@ -71,8 +72,10 @@ This is a **personal single-user app** with deliberately permissive RLS: the ano
 - **`daysBetween(a, b) = floor((a-b)/DAY_MS)` — argument order carries the sign.** Staleness uses `(now, logged_at)` (positive = days old); catalyst proximity uses `(event_date, now)` (0–3 = upcoming). Get the order wrong and the rule silently never fires.
 - **`snapshots` upserts on `snapshot_date`** — re-running the function the same day overwrites that day's row (idempotent, intended).
 - **`app_config` is a hard single row** (`check (id = 1)`). Always `update … eq('id', 1)`; never insert new config rows.
+- **Peaks are auto-tracked, not user-set.** Finnhub's free tier has **no** historical/52-week high (`/quote` gives only current + day high/low; `/stock/metric` and `/stock/candle` are premium), so the peak comes from **Yahoo Finance** (`query1.finance.yahoo.com/v8/finance/chart/{sym}` → `meta.fiftyTwoWeekHigh`, free, no key). The function keeps it as a **monotonic high-water mark**: `peak = max(storedPeak, yahoo52wHigh, currentPrice)` — corrects the value, never drops below an older cycle top, ratchets on new highs. Yahoo's prices match the Finnhub feed exactly (verified), so mixing them is safe; if Yahoo fails for a ticker it falls back to the stored peak. Settings shows peak **read-only** and never writes that column (only `entry_levels` / `watch_levels` are user-owned) — so no lost-update race.
 - **`contract_log.direction` is a DB enum** (`'up' | 'flat' | 'down'`, CHECK constraint). New values need a migration, not just frontend changes.
 - **StrictMode double-runs effects in dev**, so `loadAll()` fires twice on mount locally — harmless, but don't chase it as a bug.
+- **DDR5 news crawl uses Bing News RSS, not Google.** Google News RSS returns **503** to the Supabase edge IP; Bing (`bing.com/news/search?...&format=rss`) works. `fetchDdr5Intel()` is best-effort — on any failure it stores `{}` and the UI hides the panel. Direction inference is naive substring keyword scoring, tuned to avoid collisions (e.g. `incr[ease]`, `a[gain]st`); it's advisory, not authoritative. Reachability differs by host **and** by runtime — always probe from an edge function (not local curl), like `market-probe` did. Yahoo/Finnhub work from the edge; some hosts 429/503 the datacenter IP.
 - **Keep files UTF-8.** The original sources arrived with mojibake (garbled em-dashes/arrows); the app uses real Unicode (`—`, `→`, `▲▼`, `×`, `≤`, `−`). Watch for stray non-ASCII sneaking into places like CSS hex values.
 
 ## Design principles (preserve these when changing behavior)
@@ -80,5 +83,5 @@ This is a **personal single-user app** with deliberately permissive RLS: the ano
 1. **Default to Hold; escalate only.** Any new feature should keep quiet days quiet. Don't add noise that fires on normal volatility.
 2. **Pre-committed levels beat in-the-moment judgment.** Entry/watch levels are set sober in Settings so the daily verdict fires off them mechanically. Don't add flows that invite ad-hoc, emotional overrides.
 3. **One verdict, one source of truth.** Verdict computation stays in the edge function. The frontend displays; it does not decide.
-4. **Manual contract log is sacred.** It's the single highest-signal input. Don't bury it or try to auto-scrape it away — the hand-logging is intentional friction.
+4. **Manual contract log is sacred.** It's the single highest-signal input. Don't bury it or try to auto-scrape it away — the hand-logging is intentional friction. The **auto market-read** (crawled DDR5/DRAM news in Desk §03 + a logging *suggestion* in Settings) is **advisory only**: it never sets the verdict and never writes `contract_log`. Keep it that way — it assists logging, it doesn't replace it.
 5. **It monitors, it does not predict.** Framing in copy and UI should never imply price forecasting.
